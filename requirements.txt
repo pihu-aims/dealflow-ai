@@ -1,0 +1,8 @@
+streamlit==1.12.0
+python-dotenv==1.0.0
+pandas
+numpy
+plotly
+matplotlib
+requests
+beautifulsoup4
