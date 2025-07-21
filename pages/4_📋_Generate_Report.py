@@ -34,7 +34,7 @@ with col2:
     include_recommendations = st.checkbox("Include AI Recommendations", value=True)
 
 # Generate report button
-if st.button("Generate Report", type="primary"):
+if st.button("Generate Report"):
     # Show progress
     progress_bar = st.progress(0)
     status_text = st.empty()

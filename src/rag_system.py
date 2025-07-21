@@ -1,212 +1,194 @@
-from typing import List, Dict, Any, Optional
-import os
-from langchain.chains import RetrievalQA
-from langchain_openai import ChatOpenAI
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+import streamlit as st
+import logging
+from typing import List, Dict, Optional
+from src.ai_models import AIModelManager
+from src.vector_store import VectorStore
 
-class RAGSystem:
-    """
-    Retrieval-Augmented Generation (RAG) system for querying documents
-    and generating insights about potential M&A targets.
-    """
-    
-    def __init__(self, vector_db_path: str = "./data/vector_db"):
-        """
-        Initialize the RAG system.
+logger = logging.getLogger(__name__)
+
+# Handle supabase import gracefully
+try:
+    from src.utils import init_supabase
+except ImportError:
+    def init_supabase():
+        logger.warning("Supabase not available - using mock database")
+        return None
+
+class DealFlowRAG:
+    def __init__(self):
+        self.ai_manager = AIModelManager()
+        self.vector_store = VectorStore()
+        self.supabase = init_supabase()
         
-        Args:
-            vector_db_path: Path to the vector database
-        """
-        self.vector_db_path = vector_db_path
-        self.embeddings = OpenAIEmbeddings()
-        self.llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
-    
-    def get_vector_store(self, collection_name: str):
-        """
-        Get a vector store for a specific collection.
-        
-        Args:
-            collection_name: Name of the collection
-            
-        Returns:
-            Chroma vector store
-        """
-        return Chroma(
-            collection_name=collection_name,
-            embedding_function=self.embeddings,
-            persist_directory=self.vector_db_path
+        # Text splitter for chunking documents (Video 11)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", " ", ""]
         )
     
-    def query_documents(self, query: str, collection_name: str, k: int = 5) -> Dict[str, Any]:
-        """
-        Query documents in a collection and return relevant results.
-        
-        Args:
-            query: The query string
-            collection_name: Name of the collection to search
-            k: Number of results to return
+    def process_and_embed_documents(self) -> bool:
+        """Process all documents from database and create embeddings."""
+        try:
+            if self.supabase is None:
+                raise Exception("Database not connected")
             
-        Returns:
-            Dictionary with query results
-        """
-        vector_store = self.get_vector_store(collection_name)
-        results = vector_store.similarity_search_with_score(query, k=k)
+            # Get all processed documents from database
+            result = self.supabase.table('documents')\
+                .select('*')\
+                .eq('processed', True)\
+                .execute()
+            
+            if not result.data:
+                logger.info("No documents found to process")
+                return True
+            
+            all_chunks = []
+            all_embeddings = []
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, doc in enumerate(result.data):
+                status_text.text(f"Processing document {i+1}/{len(result.data)}: {doc['filename']}")
+                
+                # Split document into chunks (Video 11)
+                text = doc.get('extracted_text', '')
+                if not text:
+                    continue
+                
+                # Create LangChain documents
+                langchain_doc = Document(
+                    page_content=text,
+                    metadata={
+                        'filename': doc['filename'],
+                        'document_id': doc['id'],
+                        'company_id': doc.get('company_id')
+                    }
+                )
+                
+                # Split into chunks
+                chunks = self.text_splitter.split_documents([langchain_doc])
+                
+                # Prepare chunk data
+                for chunk in chunks:
+                    chunk_data = {
+                        'text': chunk.page_content,
+                        'company_name': 'Unknown',  # We'll enhance this later
+                        'document_type': doc['file_type'],
+                        'filename': doc['filename'],
+                        'document_id': doc['id']
+                    }
+                    all_chunks.append(chunk_data)
+                
+                progress_bar.progress((i + 1) / len(result.data))
+            
+            # Generate embeddings for all chunks
+            if all_chunks:
+                status_text.text("🤖 Generating AI embeddings...")
+                
+                chunk_texts = [chunk['text'] for chunk in all_chunks]
+                embeddings = self.ai_manager.generate_embeddings(chunk_texts)
+                
+                if embeddings:
+                    # Add to vector store
+                    status_text.text("💾 Saving to vector database...")
+                    success = self.vector_store.add_documents(all_chunks, embeddings)
+                    
+                    if success:
+                        status_text.text("✅ All documents processed successfully!")
+                        return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error processing documents: {str(e)}")
+            st.error(f"Error: {str(e)}")
+            return False
         
-        formatted_results = []
-        for doc, score in results:
-            formatted_results.append({
-                "content": doc.page_content,
-                "metadata": doc.metadata,
-                "relevance_score": score
-            })
-        
-        return {
-            "query": query,
-            "results": formatted_results
-        }
+        finally:
+            # Clean up progress indicators
+            if 'progress_bar' in locals():
+                progress_bar.empty()
+            if 'status_text' in locals():
+                status_text.empty()
     
-    def generate_company_analysis(self, company_name: str, collection_name: str) -> Dict[str, Any]:
-        """
-        Generate a comprehensive analysis of a company based on available documents.
-        
-        Args:
-            company_name: Name of the company to analyze
-            collection_name: Name of the collection to search
+    def search_similar_companies(self, query: str, n_results: int = 5) -> Optional[List[Dict]]:
+        """Search for similar companies based on query."""
+        try:
+            # Generate embedding for query
+            query_embedding = self.ai_manager.generate_embeddings([query])
+            if not query_embedding:
+                raise Exception("Failed to generate query embedding")
             
-        Returns:
-            Dictionary with analysis results
-        """
-        vector_store = self.get_vector_store(collection_name)
-        retriever = vector_store.as_retriever(search_kwargs={"k": 10})
-        
-        # Create analysis prompt
-        analysis_prompt = PromptTemplate.from_template("""
-        You are a financial analyst specializing in M&A target evaluation.
-        Based on the provided documents about {company_name}, create a comprehensive analysis.
-        
-        Context documents:
-        {context}
-        
-        Please provide the following analysis:
-        1. Company Overview: Brief description of the company, its industry, and main products/services
-        2. Financial Analysis: Key financial metrics, growth trends, and profitability
-        3. Market Position: Competitive landscape, market share, and growth potential
-        4. Strengths and Weaknesses: Key advantages and challenges
-        5. Strategic Fit: How this company might fit as an acquisition target
-        6. Risk Factors: Key risks to consider
-        7. Valuation Considerations: Factors that might affect valuation
-        
-        Your analysis should be detailed, balanced, and backed by information from the documents.
-        """)
-        
-        # Create document chain
-        document_chain = create_stuff_documents_chain(self.llm, analysis_prompt)
-        
-        # Create retrieval chain
-        retrieval_chain = create_retrieval_chain(retriever, document_chain)
-        
-        # Run the chain
-        response = retrieval_chain.invoke({"company_name": company_name})
-        
-        return {
-            "company_name": company_name,
-            "analysis": response["answer"],
-            "source_documents": response["context"]
-        }
+            # Search vector store
+            results = self.vector_store.similarity_search(
+                query_embedding[0], 
+                n_results=n_results
+            )
+            
+            if not results:
+                return []
+            
+            # Format results
+            formatted_results = []
+            for i in range(len(results['documents'][0])):
+                result = {
+                    'content': results['documents'][0][i],
+                    'metadata': results['metadatas'][0][i],
+                    'similarity_score': 1 - results['distances'][0][i],  # Convert distance to similarity
+                    'filename': results['metadatas'][0][i].get('filename', 'Unknown')
+                }
+                formatted_results.append(result)
+            
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Error in similarity search: {str(e)}")
+            return []
     
-    def generate_investment_thesis(self, company_name: str, collection_name: str) -> Dict[str, str]:
-        """
-        Generate an investment thesis for a potential acquisition target.
-        
-        Args:
-            company_name: Name of the company
-            collection_name: Name of the collection to search
+    def generate_investment_analysis(self, company_info: str, similar_companies: List[Dict]) -> str:
+        """Generate investment analysis using AI."""
+        try:
+            # Construct analysis prompt
+            prompt = f"""
+            Analyze this company for potential acquisition:
             
-        Returns:
-            Dictionary with the investment thesis
-        """
-        vector_store = self.get_vector_store(collection_name)
-        retriever = vector_store.as_retriever(search_kwargs={"k": 8})
-        
-        # Create thesis prompt
-        thesis_prompt = PromptTemplate.from_template("""
-        You are an M&A advisor creating an investment thesis for acquiring {company_name}.
-        Based on the provided documents, create a compelling investment thesis.
-        
-        Context documents:
-        {context}
-        
-        Your investment thesis should include:
-        1. Strategic Rationale: Why this acquisition makes strategic sense
-        2. Value Creation: How this acquisition would create value
-        3. Synergy Opportunities: Potential synergies (cost, revenue, operational)
-        4. Integration Considerations: Key factors for successful integration
-        5. ROI Projection: Expected return on investment and timeline
-        
-        Make your thesis concise, compelling, and supported by information from the documents.
-        """)
-        
-        # Create document chain
-        document_chain = create_stuff_documents_chain(self.llm, thesis_prompt)
-        
-        # Create retrieval chain
-        retrieval_chain = create_retrieval_chain(retriever, document_chain)
-        
-        # Run the chain
-        response = retrieval_chain.invoke({"company_name": company_name})
-        
-        return {
-            "company_name": company_name,
-            "investment_thesis": response["answer"]
-        }
+            Company Information:
+            {company_info[:500]}
+            
+            Similar Companies Found:
+            """
+            
+            for comp in similar_companies[:3]:  # Limit to top 3
+                prompt += f"- {comp['filename']}: {comp['content'][:200]}...\n"
+            
+            prompt += """
+            
+            Based on this information, provide:
+            1. Investment Thesis (2-3 sentences)
+            2. Key Strengths (3 bullet points)
+            3. Potential Risks (2 bullet points)
+            4. Acquisition Recommendation (Buy/Hold/Pass)
+            """
+            
+            # Generate analysis using AI
+            analysis = self.ai_manager.generate_text(prompt, max_length=400)
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error generating investment analysis: {str(e)}")
+            return "Error generating analysis. Please try again."
     
-    def generate_due_diligence_questions(self, company_name: str, collection_name: str) -> Dict[str, Any]:
-        """
-        Generate due diligence questions for a potential acquisition target.
-        
-        Args:
-            company_name: Name of the company
-            collection_name: Name of the collection to search
-            
-        Returns:
-            Dictionary with due diligence questions
-        """
-        vector_store = self.get_vector_store(collection_name)
-        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-        
-        # Create due diligence prompt
-        dd_prompt = PromptTemplate.from_template("""
-        You are an M&A due diligence specialist reviewing {company_name} as a potential acquisition target.
-        Based on the provided documents, generate key due diligence questions.
-        
-        Context documents:
-        {context}
-        
-        Generate 3-5 critical due diligence questions for each of these categories:
-        1. Financial: Questions about financial statements, projections, and accounting practices
-        2. Legal: Questions about legal issues, contracts, and compliance
-        3. Operational: Questions about operations, supply chain, and key processes
-        4. Commercial: Questions about customers, market position, and competitive landscape
-        5. Technology: Questions about technology stack, IP, and technical capabilities
-        6. Human Resources: Questions about team, culture, and organizational structure
-        
-        For each question, provide a brief explanation of why it's important to address.
-        """)
-        
-        # Create document chain
-        document_chain = create_stuff_documents_chain(self.llm, dd_prompt)
-        
-        # Create retrieval chain
-        retrieval_chain = create_retrieval_chain(retriever, document_chain)
-        
-        # Run the chain
-        response = retrieval_chain.invoke({"company_name": company_name})
-        
+    def get_rag_stats(self) -> Dict:
+        """Get RAG system statistics."""
         return {
-            "company_name": company_name,
-            "due_diligence_questions": response["answer"]
+            "vector_store": self.vector_store.get_collection_stats(),
+            "ai_models": {
+                "embedding_model": "✅ Loaded" if self.ai_manager.embedding_model else "❌ Not loaded",
+                "text_generator": "✅ Loaded" if self.ai_manager.text_generator else "❌ Not loaded"
+            }
         }

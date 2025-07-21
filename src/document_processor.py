@@ -1,174 +1,172 @@
-import os
-import tempfile
-from typing import List, Dict, Any, Optional
-import pandas as pd
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader, 
-    Docx2txtLoader,
-    UnstructuredPowerPointLoader,
-    CSVLoader,
-    TextLoader
-)
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
 import streamlit as st
+import PyPDF2
+import io
+from pathlib import Path
+import hashlib
+from datetime import datetime
+from src.utils import init_supabase
+import logging
+
+logger = logging.getLogger(__name__)
 
 class DocumentProcessor:
-    """Class for processing various document types and creating vector embeddings."""
+    def __init__(self):
+        self.supabase = init_supabase()
+        self.supported_types = ['pdf', 'txt', 'docx']
     
-    def __init__(self, vector_db_path: str = "./data/vector_db"):
-        """
-        Initialize the DocumentProcessor.
-        
-        Args:
-            vector_db_path: Path to store the vector database
-        """
-        self.vector_db_path = vector_db_path
-        self.embeddings = OpenAIEmbeddings()
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-        )
-        
-        # Ensure vector DB directory exists
-        os.makedirs(vector_db_path, exist_ok=True)
-    
-    def process_file(self, file, file_type: str) -> List[Dict[str, Any]]:
-        """
-        Process a file based on its type and extract text content.
-        
-        Args:
-            file: The file to process
-            file_type: The type of the file (pdf, docx, pptx, csv, txt)
-            
-        Returns:
-            List of document chunks with text and metadata
-        """
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}") as tmp_file:
-            tmp_file.write(file.getvalue())
-            file_path = tmp_file.name
-        
+    def extract_text_from_pdf(self, uploaded_file) -> str:
+        """Extract text from uploaded PDF file."""
         try:
-            if file_type == "pdf":
-                loader = PyPDFLoader(file_path)
-                documents = loader.load()
-            elif file_type == "docx":
-                loader = Docx2txtLoader(file_path)
-                documents = loader.load()
-            elif file_type == "pptx":
-                loader = UnstructuredPowerPointLoader(file_path)
-                documents = loader.load()
-            elif file_type == "csv":
-                loader = CSVLoader(file_path)
-                documents = loader.load()
-            elif file_type in ["txt", "json", "md"]:
-                loader = TextLoader(file_path)
-                documents = loader.load()
+            # Reset file pointer
+            uploaded_file.seek(0)
+            
+            # Read PDF
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+            
+            text = ""
+            for page_num, page in enumerate(pdf_reader.pages):
+                try:
+                    text += page.extract_text() + "\n"
+                except Exception as e:
+                    logger.warning(f"Could not extract text from page {page_num}: {str(e)}")
+                    continue
+            
+            return text.strip()
+            
+        except Exception as e:
+            logger.error(f"Error extracting PDF text: {str(e)}")
+            raise Exception(f"Failed to extract text from PDF: {str(e)}")
+    
+    def extract_text_from_txt(self, uploaded_file) -> str:
+        """Extract text from uploaded TXT file."""
+        try:
+            # Reset file pointer
+            uploaded_file.seek(0)
+            
+            # Try different encodings
+            for encoding in ['utf-8', 'latin-1', 'ascii']:
+                try:
+                    text = uploaded_file.read().decode(encoding)
+                    return text.strip()
+                except UnicodeDecodeError:
+                    continue
+            
+            raise Exception("Could not decode text file with any supported encoding")
+            
+        except Exception as e:
+            logger.error(f"Error extracting TXT text: {str(e)}")
+            raise Exception(f"Failed to extract text from TXT file: {str(e)}")
+    
+    def process_document(self, uploaded_file, company_name=None):
+        """Process uploaded document and save to database."""
+        try:
+            if self.supabase is None:
+                raise Exception("Database connection not available")
+            
+            # Get file info
+            file_size = uploaded_file.size
+            file_type = uploaded_file.type
+            filename = uploaded_file.name
+            
+            # Validate file type
+            file_extension = filename.split('.')[-1].lower()
+            if file_extension not in self.supported_types:
+                raise Exception(f"Unsupported file type: {file_extension}")
+            
+            # Extract text based on file type
+            if file_extension == 'pdf':
+                extracted_text = self.extract_text_from_pdf(uploaded_file)
+            elif file_extension == 'txt':
+                extracted_text = self.extract_text_from_txt(uploaded_file)
             else:
-                raise ValueError(f"Unsupported file type: {file_type}")
+                raise Exception(f"Text extraction not implemented for {file_extension}")
             
-            # Add metadata about the source file
-            for doc in documents:
-                doc.metadata["source"] = file.name
-                doc.metadata["file_type"] = file_type
+            # Basic text validation
+            if len(extracted_text) < 50:
+                raise Exception("Extracted text is too short (less than 50 characters)")
             
-            # Split documents into chunks
-            chunks = self.text_splitter.split_documents(documents)
+            # Generate document summary (basic for now)
+            word_count = len(extracted_text.split())
+            summary = self.generate_basic_summary(extracted_text)
             
-            return chunks
-        finally:
-            # Clean up the temporary file
-            os.unlink(file_path)
+            # Save to database
+            document_data = {
+                'filename': filename,
+                'file_type': file_type,
+                'file_size': file_size,
+                'processed': True,
+                'processing_status': 'completed',
+                'extracted_text': extracted_text[:50000],  # Limit to 50k chars
+                'document_summary': summary,
+                'key_metrics': {
+                    'word_count': word_count,
+                    'character_count': len(extracted_text),
+                    'pages_processed': extracted_text.count('\n') + 1
+                }
+            }
+            
+            # If company name provided, link to company
+            if company_name:
+                # Try to find existing company
+                company_result = self.supabase.table('companies').select('id').eq('name', company_name).execute()
+                if company_result.data:
+                    document_data['company_id'] = company_result.data[0]['id']
+            
+            # Insert document record
+            result = self.supabase.table('documents').insert(document_data).execute()
+            
+            return {
+                'success': True,
+                'document_id': result.data[0]['id'],
+                'text_length': len(extracted_text),
+                'word_count': word_count,
+                'summary': summary
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing document: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
     
-    def add_to_vector_db(self, chunks: List, collection_name: str) -> None:
-        """
-        Add document chunks to the vector database.
-        
-        Args:
-            chunks: List of document chunks
-            collection_name: Name of the collection to store the vectors
-        """
-        # Create or get the vector store
-        vector_store = Chroma(
-            collection_name=collection_name,
-            embedding_function=self.embeddings,
-            persist_directory=self.vector_db_path
-        )
-        
-        # Add documents to the vector store
-        vector_store.add_documents(chunks)
-        vector_store.persist()
-        
-        return vector_store
-    
-    def extract_metadata(self, chunks: List) -> pd.DataFrame:
-        """
-        Extract metadata from document chunks.
-        
-        Args:
-            chunks: List of document chunks
+    def generate_basic_summary(self, text: str) -> str:
+        """Generate basic summary of document content."""
+        try:
+            # Simple extractive summary - first paragraph + key metrics
+            paragraphs = text.split('\n\n')
+            first_paragraph = paragraphs[0] if paragraphs else text[:500]
             
-        Returns:
-            DataFrame with metadata
-        """
-        metadata_list = []
-        for chunk in chunks:
-            metadata = chunk.metadata.copy()
-            metadata["text_preview"] = chunk.page_content[:100] + "..."
-            metadata_list.append(metadata)
-        
-        return pd.DataFrame(metadata_list)
+            # Look for common financial keywords
+            financial_keywords = ['revenue', 'profit', 'ebitda', 'valuation', 'growth', 'market', 'employees']
+            found_keywords = [kw for kw in financial_keywords if kw.lower() in text.lower()]
+            
+            summary = f"Document contains {len(text.split())} words. "
+            if found_keywords:
+                summary += f"Key topics: {', '.join(found_keywords)}. "
+            
+            summary += f"Preview: {first_paragraph[:200]}..."
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error generating summary: {str(e)}")
+            return "Summary generation failed."
     
-    def get_collections(self) -> List[str]:
-        """
-        Get all available collections in the vector database.
-        
-        Returns:
-            List of collection names
-        """
-        if not os.path.exists(self.vector_db_path):
+    def get_recent_documents(self, limit=10):
+        """Get recently processed documents."""
+        try:
+            if self.supabase is None:
+                return []
+            
+            result = self.supabase.table('documents')\
+                .select('*')\
+                .order('upload_date', desc=True)\
+                .limit(limit)\
+                .execute()
+            
+            return result.data
+            
+        except Exception as e:
+            logger.error(f"Error getting recent documents: {str(e)}")
             return []
-        
-        # Get subdirectories in the vector DB path which represent collections
-        collections = [d for d in os.listdir(self.vector_db_path) 
-                      if os.path.isdir(os.path.join(self.vector_db_path, d))]
-        return collections
-    
-    def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
-        """
-        Get statistics about a collection.
-        
-        Args:
-            collection_name: Name of the collection
-            
-        Returns:
-            Dictionary with collection statistics
-        """
-        vector_store = Chroma(
-            collection_name=collection_name,
-            embedding_function=self.embeddings,
-            persist_directory=self.vector_db_path
-        )
-        
-        # Get collection stats
-        count = vector_store._collection.count()
-        
-        # Get unique sources
-        metadatas = vector_store.get()["metadatas"]
-        sources = set()
-        file_types = set()
-        
-        for metadata in metadatas:
-            if metadata and "source" in metadata:
-                sources.add(metadata["source"])
-            if metadata and "file_type" in metadata:
-                file_types.add(metadata["file_type"])
-        
-        return {
-            "document_count": count,
-            "unique_sources": len(sources),
-            "file_types": list(file_types),
-            "sources": list(sources)
-        }

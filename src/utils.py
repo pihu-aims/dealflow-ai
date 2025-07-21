@@ -4,6 +4,60 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from typing import List, Dict, Any, Optional
+import logging
+
+# Supabase import with graceful fallback
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    try:
+        # Try alternative import for newer versions
+        from supabase import create_client
+        from supabase.client import Client
+        SUPABASE_AVAILABLE = True
+    except ImportError:
+        # If all imports fail, define a dummy Client type
+        Client = None
+        SUPABASE_AVAILABLE = False
+        logging.warning("Supabase not installed - using mock database")
+
+def init_supabase():
+    """Initialize Supabase client with connection pooling."""
+    if not SUPABASE_AVAILABLE:
+        logging.warning("Supabase not available - using mock database")
+        return None
+        
+    try:
+        # Try to get credentials from Streamlit secrets first
+        if hasattr(st, 'secrets') and 'supabase' in st.secrets:
+            supabase_url = st.secrets['supabase']['url']
+            supabase_key = st.secrets['supabase']['key']
+        else:
+            # Fallback to environment variables
+            supabase_url = os.getenv('SUPABASE_URL')
+            supabase_key = os.getenv('SUPABASE_ANON_KEY')
+
+        if not supabase_url or not supabase_key:
+            logging.warning("Supabase credentials not found - using mock database")
+            return None
+
+        # Create client with minimal parameters to avoid compatibility issues
+        supabase = create_client(supabase_url, supabase_key)
+        
+        # Test the connection with a simple query
+        try:
+            # Try a simple health check
+            result = supabase.table('companies').select('count').limit(1).execute()
+            logging.info("✅ Supabase client initialized and tested successfully")
+        except Exception as test_error:
+            logging.warning(f"⚠️ Supabase client initialized but test failed: {str(test_error)}")
+            
+        return supabase
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to initialize Supabase: {str(e)}")
+        return None
 
 def setup_page_config():
     """Configure the Streamlit page settings."""
@@ -41,25 +95,54 @@ def display_sidebar():
             )
             st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
             st.number_input("Max Tokens", min_value=100, max_value=4000, value=1000, step=100)
-        
-        # Display collections
-        try:
-            from src.document_processor import DocumentProcessor
-            processor = DocumentProcessor()
-            collections = processor.get_collections()
-            
-            if collections:
-                st.markdown("## Collections")
-                for collection in collections:
-                    st.markdown(f"- {collection}")
-        except:
-            pass
 
 def format_currency(value):
     """Format a value as currency."""
     if pd.isna(value):
         return "N/A"
     return f"${value:,.2f}M" if value >= 1 else f"${value*1000:,.2f}K"
+
+def test_database_connection():
+    """
+    Test the database connection and return status.
+    
+    Returns:
+        tuple: (bool, str) - (success, message)
+    """
+    try:
+        supabase = init_supabase()
+        if supabase is None:
+            return False, "❌ Supabase not available - using mock database"
+        
+        # Test connection with a simple query
+        result = supabase.table('companies').select('count').execute()
+        return True, "✅ Supabase database connected"
+        
+    except Exception as e:
+        return False, f"❌ Database connection failed: {str(e)}"
+
+def get_companies_summary():
+    """
+    Get summary statistics about companies in the database.
+    
+    Returns:
+        dict: Summary statistics
+    """
+    try:
+        # Mock data for now - in a real app, you'd query the actual database
+        return {
+            'total': 1247,
+            'industries': 23,
+            'documents': 3456,
+            'recent_additions': 12
+        }
+    except Exception as e:
+        return {
+            'total': 0,
+            'industries': 0,
+            'documents': 0,
+            'recent_additions': 0
+        }
 
 def create_radar_chart(company_data: Dict[str, Any], metrics: List[str], title: str = "Company Metrics"):
     """
@@ -78,25 +161,22 @@ def create_radar_chart(company_data: Dict[str, Any], metrics: List[str], title: 
     for metric in metrics:
         if metric in company_data:
             # Simple normalization - in a real app, you'd want to normalize against industry benchmarks
-            if metric == "revenue_millions":
-                values.append(min(company_data[metric] / 100, 1))
-            elif metric == "employees":
-                values.append(min(company_data[metric] / 500, 1))
-            elif metric == "growth_rate":
-                values.append(min(company_data[metric] / 50, 1))
+            value = company_data[metric]
+            if isinstance(value, (int, float)):
+                normalized_value = min(value / 100, 1.0)  # Simple normalization
             else:
-                values.append(0.5)  # Default for unknown metrics
+                normalized_value = 0.5  # Default for non-numeric values
         else:
-            values.append(0)
+            normalized_value = 0.0
+        values.append(normalized_value)
     
-    # Create radar chart
     fig = go.Figure()
     
     fig.add_trace(go.Scatterpolar(
         r=values,
         theta=metrics,
         fill='toself',
-        name=company_data.get("company_name", "Company")
+        name=company_data.get('company_name', 'Company')
     ))
     
     fig.update_layout(
@@ -142,43 +222,6 @@ def create_comparison_chart(companies_data: List[Dict[str, Any]], metric: str, t
     
     return fig
 
-def create_growth_projection(company_data: Dict[str, Any], years: int = 5):
-    """
-    Create a growth projection chart.
-    
-    Args:
-        company_data: Dictionary with company data
-        years: Number of years to project
-        
-    Returns:
-        Plotly figure
-    """
-    current_revenue = company_data.get("revenue_millions", 50)
-    growth_rate = company_data.get("growth_rate", 15) / 100
-    
-    years_list = list(range(years + 1))
-    revenue_projection = [current_revenue * ((1 + growth_rate) ** year) for year in years_list]
-    
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=years_list,
-        y=revenue_projection,
-        mode='lines+markers',
-        name='Projected Revenue',
-        line=dict(color='royalblue', width=4)
-    ))
-    
-    fig.update_layout(
-        title=f"Revenue Projection: {company_data.get('company_name', 'Company')}",
-        xaxis_title="Years from Now",
-        yaxis_title="Revenue ($ Millions)",
-        xaxis=dict(tickmode='linear', tick0=0, dtick=1),
-        yaxis=dict(tickformat="$,.1fM")
-    )
-    
-    return fig
-
 def generate_report_html(company_data: Dict[str, Any], analysis: Dict[str, Any]) -> str:
     """
     Generate an HTML report for a company.
@@ -218,69 +261,36 @@ def generate_report_html(company_data: Dict[str, Any], analysis: Dict[str, Any])
             <h2>Company Overview</h2>
             <p><strong>Industry:</strong> {company_data.get('industry', 'N/A')}</p>
             <p><strong>Headquarters:</strong> {company_data.get('headquarters', 'N/A')}</p>
-            <p><strong>Founded:</strong> {company_data.get('founded_year', 'N/A')}</p>
-            <p><strong>Description:</strong> {company_data.get('description', 'N/A')}</p>
-            
-            <div class="metrics">
-                <div class="metric">
-                    <div class="metric-value">{format_currency(company_data.get('revenue_millions', 0))}</div>
-                    <div class="metric-label">Annual Revenue</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">{company_data.get('employees', 'N/A')}</div>
-                    <div class="metric-label">Employees</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-value">{company_data.get('growth_rate', 'N/A')}%</div>
-                    <div class="metric-label">Growth Rate</div>
-                </div>
+            <p><strong>Founded:</strong> {company_data.get('founded', 'N/A')}</p>
+            <p><strong>Employees:</strong> {company_data.get('employees', 'N/A')}</p>
+        </div>
+        
+        <div class="section">
+            <h2>Financial Metrics</h2>
+            <div class="metric">
+                <div class="metric-value">{format_currency(company_data.get('revenue', 0))}</div>
+                <div class="metric-label">Revenue</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value">{format_currency(company_data.get('valuation', 0))}</div>
+                <div class="metric-label">Valuation</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value">{company_data.get('growth_rate', 'N/A')}%</div>
+                <div class="metric-label">Growth Rate</div>
             </div>
         </div>
         
         <div class="section">
-            <h2>Financial Analysis</h2>
-            <p>{analysis.get('financial_analysis', 'No financial analysis available.')}</p>
+            <h2>Analysis Summary</h2>
+            <p>{analysis.get('summary', 'No analysis available.')}</p>
         </div>
         
         <div class="section">
-            <h2>Strategic Fit</h2>
-            <p>{analysis.get('strategic_fit', 'No strategic fit analysis available.')}</p>
-        </div>
-        
-        <div class="section">
-            <h2>SWOT Analysis</h2>
-            <table>
-                <tr>
-                    <th>Strengths</th>
-                    <th>Weaknesses</th>
-                </tr>
-                <tr>
-                    <td>{analysis.get('strengths', 'No data available.')}</td>
-                    <td>{analysis.get('weaknesses', 'No data available.')}</td>
-                </tr>
-                <tr>
-                    <th>Opportunities</th>
-                    <th>Threats</th>
-                </tr>
-                <tr>
-                    <td>{analysis.get('opportunities', 'No data available.')}</td>
-                    <td>{analysis.get('threats', 'No data available.')}</td>
-                </tr>
-            </table>
-        </div>
-        
-        <div class="section">
-            <h2>Valuation Considerations</h2>
-            <p>{analysis.get('valuation', 'No valuation analysis available.')}</p>
-        </div>
-        
-        <div class="section">
-            <h2>Recommendation</h2>
-            <p>{analysis.get('recommendation', 'No recommendation available.')}</p>
-        </div>
-        
-        <div class="footer">
-            <p>This report was generated by DealFlow AI. The information contained herein is for informational purposes only.</p>
+            <h2>Investment Recommendation</h2>
+            <p><strong>Score:</strong> {analysis.get('investment_score', 'N/A')}/10</p>
+            <p><strong>Risk Level:</strong> {analysis.get('risk_level', 'N/A')}</p>
+            <p><strong>Recommendation:</strong> {analysis.get('recommendation', 'N/A')}</p>
         </div>
     </body>
     </html>
